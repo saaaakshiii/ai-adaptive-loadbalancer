@@ -3,7 +3,7 @@ import os
 import time
 from fastapi import FastAPI, HTTPException, Query
 from backend.metrics import metrics
-
+    
 app = FastAPI(title="Backend Server")
 SERVER_ID = os.getenv("SERVER_ID", "server-local")
 

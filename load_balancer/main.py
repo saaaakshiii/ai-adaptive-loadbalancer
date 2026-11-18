@@ -23,6 +23,8 @@ error_count = 0
 recent_requests = deque(maxlen=500)
 client: httpx.AsyncClient | None = None
 
+# opens shared HTTP client at boot
+# saves final q-table when server is off
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client
