@@ -2,7 +2,10 @@ import os
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-
+import asyncio
+import json
+import logging
+import redis.asyncio as redis
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
@@ -13,6 +16,22 @@ from load_balancer.health_checker import collect_backend_metrics
 from load_balancer.algorithms.round_robin import RoundRobin
 from load_balancer.algorithms.least_connections import LeastConnections
 from load_balancer.algorithms.q_learning import QLearningAgent
+
+logger = logging.getLogger(__name__)
+
+redis_client = None
+metrics_collector_task = None
+
+METRICS_KEY = "metrics:snapshot"
+METRICS_INTERVAL = 1
+METRICS_TTL = 5
+
+active_requests = {
+    backend["name"]: 0
+    for backend in BACKENDS
+}
+
+selection_lock = asyncio.Lock()
 
 round_robin = RoundRobin()
 least_connections = LeastConnections()
@@ -25,24 +44,96 @@ client: httpx.AsyncClient | None = None
 
 # opens shared HTTP client at boot
 # saves final q-table when server is off
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client
-    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=2.0))
-    yield
-    agent.save()
-    await client.aclose()
+    global client, redis_client, metrics_collector_task
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0, connect=2.0)
+    )
+
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+    redis_client = redis.from_url(
+        redis_url,
+        decode_responses=True
+    )
+
+    await redis_client.ping()
+
+    # Create the first snapshot before accepting requests.
+    await refresh_metrics_snapshot()
+
+    # Start periodic background collection.
+    metrics_collector_task = asyncio.create_task(metrics_collector())
+
+    try:
+        yield
+    finally:
+        metrics_collector_task.cancel()
+
+        try:
+            await metrics_collector_task
+        except asyncio.CancelledError:
+            pass
+
+        agent.save()
+        await redis_client.aclose()
+        await client.aclose()
 
 app = FastAPI(title="AI Adaptive Load Balancer", lifespan=lifespan)
 
 class AlgorithmUpdate(BaseModel):
     algorithm: str
 
-async def current_metrics():
+async def refresh_metrics_snapshot():
     results = await collect_backend_metrics(client, BACKENDS)
-    healthy = [i for i, (ok, _) in enumerate(results) if ok]
-    metrics = [m for _, m in results]
-    return healthy, metrics
+
+    healthy = [
+        i for i, (ok, _) in enumerate(results) if ok
+    ]
+
+    metrics = [
+        m for _, m in results
+    ]
+
+    snapshot = {
+        "healthy": healthy,
+        "metrics": metrics,
+        "updated_at": time.time()
+    }
+
+    await redis_client.set(
+        METRICS_KEY,
+        json.dumps(snapshot),
+        ex=METRICS_TTL
+    )
+
+
+async def metrics_collector():
+    while True:
+        try:
+            await refresh_metrics_snapshot()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Metrics collection failed")
+
+        await asyncio.sleep(METRICS_INTERVAL)
+
+async def current_metrics():
+    snapshot = await redis_client.get(METRICS_KEY)
+
+    if snapshot is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Metrics snapshot unavailable or expired"
+        )
+
+    data = json.loads(snapshot)
+
+    return data["healthy"], data["metrics"]
 
 @app.get("/")
 async def home():
@@ -111,19 +202,32 @@ async def get_metrics():
 @app.api_route("/proxy/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_request(path: str, request: Request):
     global request_count, error_count
+    selected_algorithm = algorithm
     healthy, before_metrics = await current_metrics()
     if not healthy:
         raise HTTPException(503, "No healthy backend servers")
 
-    if algorithm == "round_robin":
-        selected = round_robin.choose(healthy, before_metrics)
-        state = None
-    elif algorithm == "least_connections":
-        selected = least_connections.choose(healthy, before_metrics)
-        state = None
-    else:
-        state = agent.state_from_metrics(before_metrics)
-        selected = agent.choose_action(state, healthy, len(BACKENDS))
+    async with selection_lock:
+        if selected_algorithm == "round_robin":
+            selected = round_robin.choose(healthy, before_metrics)
+            state = None
+
+        elif selected_algorithm == "least_connections":
+            # Use live in-memory counters instead of stale Redis metrics.
+            live_metrics = [
+                {"active_requests": active_requests[b["name"]]}
+                for b in BACKENDS
+            ]
+
+            selected = least_connections.choose(healthy, live_metrics)
+            state = None
+
+        else:
+            state = agent.state_from_metrics(before_metrics)
+            selected = agent.choose_action(state, healthy, len(BACKENDS))
+
+        if selected is not None:
+            active_requests[BACKENDS[selected]["name"]] += 1
 
     if selected is None:
         raise HTTPException(503, "No backend available")
@@ -132,37 +236,50 @@ async def proxy_request(path: str, request: Request):
     started = time.perf_counter()
     status_code = 502
     success = False
-    body = await request.body()
-    target_url = f"{backend['url']}/{path}"
-    if request.url.query:
-        target_url += f"?{request.url.query}"
-
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in {"host", "content-length", "connection"}
-    }
 
     try:
-        upstream = await client.request(
-            request.method, target_url, content=body, headers=headers
-        )
-        status_code = upstream.status_code
-        success = 200 <= status_code < 400
-        response_headers = {
-            k: v for k, v in upstream.headers.items()
-            if k.lower() in {"content-type", "cache-control"}
+        body = await request.body()
+        target_url = f"{backend['url']}/{path}"
+
+        if request.url.query:
+            target_url += f"?{request.url.query}"
+
+        headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in {"host", "content-length", "connection"}
         }
-        response = Response(
-            content=upstream.content,
-            status_code=status_code,
-            headers=response_headers
-        )
-    except httpx.HTTPError:
-        response = Response(
-            content=b'{"detail":"Backend request failed"}',
-            status_code=502,
-            media_type="application/json"
-        )
+
+        try:
+            upstream = await client.request(
+                request.method,
+                target_url,
+                content=body,
+                headers=headers
+            )
+
+            status_code = upstream.status_code
+            success = 200 <= status_code < 400
+
+            response_headers = {
+                k: v for k, v in upstream.headers.items()
+                if k.lower() in {"content-type", "cache-control"}
+            }
+
+            response = Response(
+                content=upstream.content,
+                status_code=status_code,
+                headers=response_headers
+            )
+
+        except httpx.HTTPError:
+            response = Response(
+                content=b'{"detail":"Backend request failed"}',
+                status_code=502,
+                media_type="application/json"
+            )
+
+    finally:
+        active_requests[backend["name"]] -= 1
 
     latency_ms = (time.perf_counter() - started) * 1000
     request_count += 1
@@ -177,7 +294,7 @@ async def proxy_request(path: str, request: Request):
         "success": success
     })
 
-    if algorithm == "q_learning":
+    if selected_algorithm == "q_learning":
         next_healthy, after_metrics = await current_metrics()
         next_state = agent.state_from_metrics(after_metrics)
         cpu = float(before_metrics[selected].get("cpu_percent", 0))
@@ -190,5 +307,5 @@ async def proxy_request(path: str, request: Request):
         )
 
     response.headers["X-Backend-Server"] = backend["name"]
-    response.headers["X-Load-Balancer-Algorithm"] = algorithm
+    response.headers["X-Load-Balancer-Algorithm"] = selected_algorithm
     return response
