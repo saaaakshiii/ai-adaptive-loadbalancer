@@ -1,3 +1,4 @@
+import threading
 import json
 import os
 import random
@@ -20,6 +21,7 @@ class QLearningAgent:
         self.epsilon_decay = epsilon_decay
         self.q = {}
         self.updates = 0
+        self.lock = threading.RLock()
         self._load()
 
     @staticmethod
@@ -43,37 +45,65 @@ class QLearningAgent:
             self.q[state].extend([0.0] * (n_actions - len(self.q[state])))
         return self.q[state]
 
+
     def choose_action(self, state, healthy_indices, n_actions):
-        if not healthy_indices:
-            return None
-        row = self._row(state, n_actions)
-        if random.random() < self.epsilon:
-            return random.choice(healthy_indices)
-        # Random tie-breaking avoids always favouring server A at startup.
-        best = max(row[i] for i in healthy_indices)
-        candidates = [i for i in healthy_indices if row[i] == best]
-        return random.choice(candidates)
+        with self.lock:
+            if not healthy_indices:
+                return None
+
+            row = self._row(state, n_actions)
+
+            if random.random() < self.epsilon:
+                return random.choice(healthy_indices)
+
+            # Random tie-breaking avoids always favouring server A at startup.
+            best = max(row[i] for i in healthy_indices)
+            candidates = [
+                i for i in healthy_indices if row[i] == best
+            ]
+            return random.choice(candidates)
+
+
 
     def update(self, state, action, reward, next_state, next_healthy, n_actions):
-        row = self._row(state, n_actions)
-        next_row = self._row(next_state, n_actions)
-        future = max((next_row[i] for i in next_healthy), default=0.0)
-        old = row[action]
-        row[action] = old + self.alpha * (reward + self.gamma * future - old)
-        self.updates += 1
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-        if self.updates % 10 == 0:
-            self.save()
+        with self.lock:
+            row = self._row(state, n_actions)
+            next_row = self._row(next_state, n_actions)
+
+            future = max(
+                (next_row[i] for i in next_healthy),
+                default=0.0,
+            )
+
+            old = row[action]
+            row[action] = old + self.alpha * (
+                reward + self.gamma * future - old
+            )
+
+            self.updates += 1
+            self.epsilon = max(
+                self.epsilon_min,
+                self.epsilon * self.epsilon_decay,
+            )
+
+            if self.updates % 10 == 0:
+                self.save()
+
+
 
     def save(self):
-        self.table_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.table_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({
-            "q_table": self.q,
-            "epsilon": self.epsilon,
-            "updates": self.updates
-        }, indent=2))
-        tmp.replace(self.table_path)
+        with self.lock:
+            self.table_path.parent.mkdir(parents=True, exist_ok=True)
+
+            tmp = self.table_path.with_suffix(".tmp")
+
+            tmp.write_text(json.dumps({
+                "q_table": self.q,
+                "epsilon": self.epsilon,
+                "updates": self.updates
+            }, indent=2))
+
+            tmp.replace(self.table_path)
 
     def _load(self):
         if not self.table_path.exists():

@@ -1,0 +1,81 @@
+
+{
+  "experiments": [
+    {
+      "id": "round_robin_concurrent_60",
+      "algorithm": "round_robin",
+      "display_name": "Round Robin",
+      "date": "2026-11-19",
+      "requests": 60,
+      "concurrency": 10,
+      "distribution": {
+        "server-a": 20,
+        "server-b": 20,
+        "server-c": 20
+      },
+      "average_latency_ms": 160.37,
+      "p95_latency_ms": 316.53,
+      "errors": 0
+    },
+    {
+      "id": "least_connections_concurrent_60",
+      "algorithm": "least_connections",
+      "display_name": "Least Connections",
+      "date": "2026-11-19",
+      "requests": 60,
+      "concurrency": 10,
+      "distribution": {
+        "server-a": 9,
+        "server-b": 18,
+        "server-c": 33
+      },
+      "average_latency_ms": 112.57,
+      "p95_latency_ms": 314.22,
+      "errors": 0
+    },
+    {
+      "id": "q_learning_concurrent_60",
+      "algorithm": "q_learning",
+      "display_name": "Q-learning",
+      "date": "2026-11-19",
+      "requests": 60,
+      "concurrency": 10,
+      "distribution": {
+        "server-a": 1,
+        "server-b": 2,
+        "server-c": 57
+      },
+      "average_latency_ms": 73.53,
+      "p95_latency_ms": 92.2,
+      "errors": 0
+    },
+    {
+      "id": "adaptive_concurrent_1800",
+      "algorithm": "adaptive",
+      "display_name": "Adaptive Load Balancer",
+      "date": "2026-11-19",
+      "requests": 1800,
+      "concurrency": 20,
+      "distribution": {
+        "server-a": 252,
+        "server-b": 251,
+        "server-c": 1297
+      },
+      "algorithm_distribution": {
+        "round_robin": 666,
+        "q_learning": 1134
+      },
+      "average_latency_ms": 112.95,
+      "p95_latency_ms": 317.35,
+      "errors": 0
+    }
+  ],
+  "environment": {
+    "backend_delays_ms": {
+      "server-a": 300,
+      "server-b": 100,
+      "server-c": 50
+    },
+    "description": "Controlled benchmarks using three simulated backend servers. Round Robin, Least Connections, and Q-learning were tested with 60 requests and 10 concurrent workers each. Adaptive Load Balancing was tested with 1800 requests and 20 concurrent workers."
+  }
+}

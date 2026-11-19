@@ -1,25 +1,75 @@
+
 from urllib.request import urlopen
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from statistics import mean
 from time import perf_counter
+from math import ceil
+import json
 
-latencies = []
-distribution = Counter()
+URL = "http://localhost:8000/proxy/work"
+TOTAL_REQUESTS = 60
+MAX_WORKERS = 10
 
-for i in range(60):
+
+def get_algorithm():
+    with urlopen("http://localhost:8000/algorithm") as response:
+        return json.loads(response.read())["algorithm"]
+
+
+def send_request():
     start = perf_counter()
 
-    with urlopen("http://localhost:8000/proxy/work", timeout=10) as response:
-        server = response.headers.get("X-Backend-Server", "unknown")
-        response.read()
+    try:
+        with urlopen(URL, timeout=10) as response:
+            server = response.headers.get("X-Backend-Server", "unknown")
+            response.read()
+            latency = (perf_counter() - start) * 1000
 
-    latencies.append((perf_counter() - start) * 1000)
-    distribution[server] += 1
+            return server, latency, False
 
-ordered = sorted(latencies)
+    except Exception as exc:
+        latency = (perf_counter() - start) * 1000
+        return "failed", latency, True
 
-print("\nQ-LEARNING RESULTS")
-print("Requests:", len(latencies))
-print("Distribution:", dict(distribution))
-print("Average latency:", round(mean(latencies), 2), "ms")
-print("P95 latency:", round(ordered[int(0.95 * len(ordered)) - 1], 2), "ms")
+
+def main():
+    algorithm = get_algorithm()
+
+    latencies = []
+    distribution = Counter()
+    errors = 0
+
+    print(f"\n{algorithm.upper()} RESULTS")
+    print(f"Sending {TOTAL_REQUESTS} requests with {MAX_WORKERS} workers...")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(send_request)
+            for _ in range(TOTAL_REQUESTS)
+        ]
+
+        for future in as_completed(futures):
+            server, latency, failed = future.result()
+
+            latencies.append(latency)
+            distribution[server] += 1
+
+            if failed:
+                errors += 1
+
+    ordered = sorted(latencies)
+    p95 = ordered[ceil(0.95 * len(ordered)) - 1] if ordered else 0
+
+    print("\nBENCHMARK RESULTS")
+    print("Algorithm:", algorithm)
+    print("Requests:", TOTAL_REQUESTS)
+    print("Concurrency:", MAX_WORKERS)
+    print("Distribution:", dict(distribution))
+    print("Average latency:", round(mean(latencies), 2), "ms")
+    print("P95 latency:", round(p95, 2), "ms")
+    print("Errors:", errors)
+
+
+if __name__ == "__main__":
+    main()

@@ -13,3 +13,11 @@ __pycache__/
 
 # Environment variables
 .env
+# Local backup files
+*.backup
+*.save
+*.pre_adaptive_backup
+*_backup.py
+
+# Numbered editor backup files
+*.save.*

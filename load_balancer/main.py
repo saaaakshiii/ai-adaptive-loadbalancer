@@ -10,7 +10,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
-
+from load_balancer.adaptive_controller import AdaptiveController
 from load_balancer.config import BACKENDS, Q_TABLE_PATH
 from load_balancer.health_checker import collect_backend_metrics
 from load_balancer.algorithms.round_robin import RoundRobin
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 redis_client = None
 metrics_collector_task = None
+adaptive_controller_task = None
 
 METRICS_KEY = "metrics:snapshot"
 METRICS_INTERVAL = 1
@@ -37,6 +38,20 @@ round_robin = RoundRobin()
 least_connections = LeastConnections()
 agent = QLearningAgent(table_path=Q_TABLE_PATH)
 algorithm = "round_robin"
+
+# Adaptive routing state
+mode = "manual"
+adaptive_controller = AdaptiveController()
+
+last_adaptive_decision = {
+    "workload": "unknown",
+    "candidate": "round_robin",
+    "reason": "Adaptive controller has not evaluated traffic yet",
+    "statistics": {},
+}
+
+decision_history = deque(maxlen=100)
+
 request_count = 0
 error_count = 0
 recent_requests = deque(maxlen=500)
@@ -48,6 +63,7 @@ client: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, redis_client, metrics_collector_task
+    global adaptive_controller_task
 
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(10.0, connect=2.0)
@@ -65,27 +81,38 @@ async def lifespan(app: FastAPI):
     # Create the first snapshot before accepting requests.
     await refresh_metrics_snapshot()
 
-    # Start periodic background collection.
+    # Start background tasks.
     metrics_collector_task = asyncio.create_task(metrics_collector())
+    adaptive_controller_task = asyncio.create_task(
+        adaptive_controller_loop()
+    )
 
     try:
         yield
     finally:
+        # Stop both background tasks.
         metrics_collector_task.cancel()
+        adaptive_controller_task.cancel()
 
-        try:
-            await metrics_collector_task
-        except asyncio.CancelledError:
-            pass
+        for task in (metrics_collector_task, adaptive_controller_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
+        # Persist state and close shared connections.
         agent.save()
         await redis_client.aclose()
         await client.aclose()
+
 
 app = FastAPI(title="AI Adaptive Load Balancer", lifespan=lifespan)
 
 class AlgorithmUpdate(BaseModel):
     algorithm: str
+
+class ModeUpdate(BaseModel):
+    mode: str
 
 async def refresh_metrics_snapshot():
     results = await collect_backend_metrics(client, BACKENDS)
@@ -121,6 +148,57 @@ async def metrics_collector():
             logger.exception("Metrics collection failed")
 
         await asyncio.sleep(METRICS_INTERVAL)
+
+async def adaptive_controller_loop():
+    global algorithm, last_adaptive_decision
+
+    while True:
+        try:
+            if mode == "automatic":
+                healthy, backend_metrics = await current_metrics()
+
+                decision = adaptive_controller.evaluate(
+                    current_algorithm=algorithm,
+                    recent_requests=list(recent_requests),
+                    backend_metrics=backend_metrics,
+                    q_learning_updates=agent.updates,
+                    healthy_count=len(healthy),
+                )
+
+                last_adaptive_decision = decision.copy()
+
+                if decision["should_switch"]:
+                    async with selection_lock:
+                        # Recheck mode and algorithm before switching.
+                        if mode == "automatic" and algorithm != decision["candidate"]:
+                            previous = algorithm
+                            algorithm = decision["candidate"]
+
+                            adaptive_controller.mark_switched()
+
+                            event = {
+                                "timestamp": time.time(),
+                                "from": previous,
+                                "to": algorithm,
+                                "workload": decision["workload"],
+                                "reason": decision["reason"],
+                                "statistics": decision["statistics"],
+                            }
+
+                            decision_history.append(event)
+                            logger.info(
+                                "Adaptive routing switched: %s -> %s (%s)",
+                                previous,
+                                algorithm,
+                                decision["reason"],
+                            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Adaptive controller evaluation failed")
+
+        await asyncio.sleep(adaptive_controller.evaluation_interval)
 
 async def current_metrics():
     snapshot = await redis_client.get(METRICS_KEY)
@@ -161,16 +239,44 @@ async def servers():
 
 @app.get("/algorithm")
 async def get_algorithm():
-    return {"algorithm": algorithm, "available": ["round_robin", "least_connections", "q_learning"]}
+    return {
+        "algorithm": algorithm,
+        "available": [
+            "round_robin",
+            "least_connections",
+            "q_learning",
+        ],
+    }
+
 
 @app.post("/algorithm")
 async def set_algorithm(body: AlgorithmUpdate):
-    global algorithm
-    allowed = {"round_robin", "least_connections", "q_learning"}
+    global algorithm, mode
+
+    allowed = {
+        "round_robin",
+        "least_connections",
+        "q_learning",
+    }
+
     if body.algorithm not in allowed:
-        raise HTTPException(400, f"Choose one of: {', '.join(sorted(allowed))}")
-    algorithm = body.algorithm
-    return {"algorithm": algorithm}
+        raise HTTPException(
+            400,
+            f"Choose one of: {', '.join(sorted(allowed))}",
+        )
+
+    async with selection_lock:
+        # Explicit algorithm selection means manual control.
+        mode = "manual"
+        algorithm = body.algorithm
+
+        adaptive_controller.pending_algorithm = None
+        adaptive_controller.confirmation_count = 0
+
+    return {
+        "algorithm": algorithm,
+        "mode": mode,
+    }
 
 @app.get("/metrics")
 async def get_metrics():
@@ -199,15 +305,66 @@ async def get_metrics():
         "recent_requests": list(recent_requests)[-100:],
     }
 
+@app.get("/mode")
+async def get_mode():
+    return {
+        "mode": mode,
+        "available": ["manual", "automatic"],
+    }
+
+
+@app.post("/mode")
+async def set_mode(body: ModeUpdate):
+    global mode
+
+    if body.mode not in {"manual", "automatic"}:
+        raise HTTPException(
+            400,
+            "Mode must be either 'manual' or 'automatic'",
+        )
+
+    async with selection_lock:
+        mode = body.mode
+
+        adaptive_controller.pending_algorithm = None
+        adaptive_controller.confirmation_count = 0
+
+    return {
+        "mode": mode,
+        "algorithm": algorithm,
+    }
+
+@app.get("/adaptive/status")
+async def adaptive_status():
+    return {
+        "mode": mode,
+        "algorithm": algorithm,
+        "last_decision": last_adaptive_decision,
+        "q_learning_updates": agent.updates,
+        "minimum_q_learning_updates": (
+            adaptive_controller.min_q_learning_updates
+        ),
+        "pending_algorithm": adaptive_controller.pending_algorithm,
+        "confirmation_count": adaptive_controller.confirmation_count,
+    }
+
+
+@app.get("/adaptive/history")
+async def adaptive_history():
+    return {
+        "total_switches": len(decision_history),
+        "history": list(decision_history),
+    }
+
 @app.api_route("/proxy/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_request(path: str, request: Request):
     global request_count, error_count
-    selected_algorithm = algorithm
     healthy, before_metrics = await current_metrics()
     if not healthy:
         raise HTTPException(503, "No healthy backend servers")
 
     async with selection_lock:
+        selected_algorithm = algorithm
         if selected_algorithm == "round_robin":
             selected = round_robin.choose(healthy, before_metrics)
             state = None
@@ -294,17 +451,34 @@ async def proxy_request(path: str, request: Request):
         "success": success
     })
 
+
     if selected_algorithm == "q_learning":
-        next_healthy, after_metrics = await current_metrics()
-        next_state = agent.state_from_metrics(after_metrics)
-        cpu = float(before_metrics[selected].get("cpu_percent", 0))
-        overload_penalty = max(0.0, cpu - 80.0) / 20.0
-        # Reward successful, fast responses; penalize failures and overload.
-        reward = (2.0 if success else -5.0) - min(latency_ms / 500.0, 4.0) - overload_penalty
-        agent.update(
-            state, selected, reward, next_state,
-            next_healthy, len(BACKENDS)
-        )
+        try:
+            next_healthy, after_metrics = await current_metrics()
+            next_state = agent.state_from_metrics(after_metrics)
+
+            cpu = float(before_metrics[selected].get("cpu_percent", 0))
+            overload_penalty = max(0.0, cpu - 80.0) / 20.0
+
+            # Reward successful, fast responses; penalize failures and overload.
+            reward = (
+                (2.0 if success else -5.0)
+                - min(latency_ms / 500.0, 4.0)
+                - overload_penalty
+            )
+
+            agent.update(
+                state,
+                selected,
+                reward,
+                next_state,
+                next_healthy,
+                len(BACKENDS),
+            )
+
+        except Exception:
+            logger.exception("Q-learning update failed")
+
 
     response.headers["X-Backend-Server"] = backend["name"]
     response.headers["X-Load-Balancer-Algorithm"] = selected_algorithm
