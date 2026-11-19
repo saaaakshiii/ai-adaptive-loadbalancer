@@ -32,13 +32,19 @@ services:
     environment:
       BACKENDS: "server-a=http://server-a:8001,server-b=http://server-b:8001,server-c=http://server-c:8001"
       Q_TABLE_PATH: /app/data/q_table.json
+      REDIS_URL: redis://redis:6379/0
     ports: ["8000:8000"]
     volumes:
       - ./data:/app/data
     depends_on:
-      - server-a
-      - server-b
-      - server-c
+      server-a:
+        condition: service_started
+      server-b:
+        condition: service_started
+      server-c:
+        condition: service_started
+      redis:
+        condition: service_healthy
 
   dashboard:
     build: .
@@ -56,3 +62,14 @@ services:
     ports: ["8089:8089"]
     depends_on:
       - load-balancer
+  redis:
+    image: redis:7-alpine
+    container_name: load-balancer-redis
+    command: redis-server --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
