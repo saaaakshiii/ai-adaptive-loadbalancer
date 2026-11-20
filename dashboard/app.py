@@ -12,22 +12,108 @@ st.caption("Distributed backend monitoring and routing experiments")
 
 with st.sidebar:
     st.header("Routing control")
-    selected = st.selectbox(
-        "Select algorithm",
-        ["round_robin", "least_connections", "q_learning"],
-        format_func=lambda x: {
-            "round_robin": "Round Robin",
-            "least_connections": "Least Connections",
-            "q_learning": "Q-learning",
-        }[x]
+
+    # Fetch the current routing mode from the load balancer
+    try:
+        mode_data = requests.get(f"{LB_URL}/mode", timeout=3).json()
+        current_mode = mode_data.get("mode")
+
+        if current_mode not in ["manual", "automatic"]:
+            st.error(f"Invalid routing mode received: {current_mode}")
+            st.stop()
+    except requests.RequestException as exc:
+        st.error(f"Could not fetch routing mode: {exc}")
+        st.stop()
+
+    # Manual / Automatic mode selector
+    selected_mode = st.selectbox(
+        "Routing mode",
+        ["manual", "automatic"],
+        index=["manual", "automatic"].index(current_mode),
+        format_func=lambda x: x.capitalize()
     )
-    if st.button("Apply algorithm", use_container_width=True):
+
+    # Apply mode changes immediately
+    if selected_mode != current_mode:
         try:
-            r = requests.post(f"{LB_URL}/algorithm", json={"algorithm": selected}, timeout=3)
+            r = requests.post(
+                f"{LB_URL}/mode",
+                json={"mode": selected_mode},
+                timeout=3
+            )
             r.raise_for_status()
-            st.success("Algorithm updated")
+            st.rerun()
         except requests.RequestException as exc:
-            st.error(f"Could not update algorithm: {exc}")
+            st.error(f"Could not update routing mode: {exc}")
+
+    st.divider()
+
+    if selected_mode == "manual":
+        st.subheader("Manual routing")
+
+        try:
+            response = requests.get(f"{LB_URL}/algorithm", timeout=3)
+            response.raise_for_status()
+            algorithm_data = response.json()
+
+            algorithms = algorithm_data["available"]
+            current_algorithm = algorithm_data["algorithm"]
+
+            if current_algorithm not in algorithms:
+                st.error("Load balancer returned an invalid algorithm.")
+                st.stop()
+        except (requests.RequestException, KeyError, ValueError) as exc:
+            st.error(f"Could not fetch algorithm configuration: {exc}")
+            st.stop()
+
+        selected = st.selectbox(
+            "Select algorithm",
+            algorithms,
+            index=algorithms.index(current_algorithm),
+            format_func=lambda x: {
+                "round_robin": "Round Robin",
+                "least_connections": "Least Connections",
+                "q_learning": "Q-learning",
+            }[x]
+        )
+
+        if st.button("Apply algorithm", use_container_width=True):
+            try:
+                r = requests.post(
+                    f"{LB_URL}/algorithm",
+                    json={"algorithm": selected},
+                    timeout=3
+                )
+                r.raise_for_status()
+                st.success("Algorithm updated")
+            except requests.RequestException as exc:
+                st.error(f"Could not update algorithm: {exc}")
+
+    else:
+        st.subheader("Automatic routing")
+
+        try:
+            adaptive = requests.get(
+                f"{LB_URL}/adaptive/status", timeout=3
+            ).json()
+
+            st.metric("Current algorithm", adaptive["algorithm"])
+            st.metric("Detected workload", adaptive["last_decision"]["workload"])
+            st.metric("Q-learning updates", adaptive["q_learning_updates"])
+
+            st.caption(
+                f"Recommended: {adaptive['last_decision']['candidate']}"
+            )
+
+            st.caption(
+                f"Switch confirmations: {adaptive['confirmation_count']}/3"
+            )
+
+        except requests.RequestException as exc:
+            st.error(f"Could not fetch adaptive status: {exc}")
+
+    st.divider()
+
     auto = st.checkbox("Auto-refresh every 3 seconds", value=False)
 
 try:
@@ -75,7 +161,7 @@ a.metric("Current algorithm", metrics["algorithm"])
 b.metric("Q-table updates", metrics["q_learning_updates"])
 c.metric("Exploration rate (epsilon)", metrics["epsilon"])
 
-st.info("Open http://localhost:8000/docs for the load balancer API. Use /proxy/work?delay=0.05 to send a test request.")
+st.info(f"Open {LB_URL}/docs for the load balancer API. Use {LB_URL}/proxy/work?delay=0.05 to send a test request.")
 
 if auto:
     time.sleep(3)

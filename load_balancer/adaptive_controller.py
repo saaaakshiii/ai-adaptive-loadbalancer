@@ -15,6 +15,8 @@ class AdaptiveController:
         "q_learning",
     }
 
+    MIN_LATENCY_SAMPLES = 5
+
     def __init__(
         self,
         evaluation_interval=2,
@@ -57,6 +59,10 @@ class AdaptiveController:
             if window else 0.0
         )
 
+        has_enough_samples = (
+           len(window) >= self.MIN_LATENCY_SAMPLES
+        )
+
         max_cpu = max(
             (float(m.get("cpu_percent", 0)) for m in backend_metrics),
             default=0.0,
@@ -70,8 +76,14 @@ class AdaptiveController:
         # High workload conditions.
         if (
             request_rate >= 8
-            or average_latency >= 250
-            or error_rate >= 0.10
+            or (
+                has_enough_samples
+                and average_latency >= 250
+            )
+            or (
+                has_enough_samples
+                and error_rate >= 0.10
+            )
             or max_cpu >= 75
             or max_active >= 8
         ):
@@ -80,8 +92,14 @@ class AdaptiveController:
         # Medium workload conditions.
         elif (
             request_rate >= 3
-            or average_latency >= 120
-            or error_rate >= 0.03
+            or (
+                has_enough_samples
+                and average_latency >= 120
+            )
+            or (
+                has_enough_samples
+                and error_rate >= 0.03
+            )
             or max_cpu >= 50
             or max_active >= 3
         ):

@@ -103,6 +103,36 @@ class TestAdaptiveController(unittest.TestCase):
         self.assertFalse(second["should_switch"])
         self.assertTrue(third["should_switch"])
 
+    def test_few_slow_requests_do_not_trigger_high_workload(self):
+        requests = [
+            {
+                "timestamp": time.time() - 1,
+                "latency_ms": 500,
+                "success": True,
+            }
+            for _ in range(2)
+        ]
+
+        result = self.evaluate(requests=requests)
+
+        self.assertEqual(result["workload"], "low")
+        self.assertEqual(result["candidate"], "round_robin")
+
+    def test_five_slow_requests_trigger_high_workload(self):
+        requests = [
+            {
+                "timestamp": time.time() - 1,
+                "latency_ms": 300,
+                "success": True,
+            }
+            for _ in range(5)
+        ]
+
+        result = self.evaluate(requests=requests)
+
+        self.assertEqual(result["workload"], "high")
+        self.assertEqual(result["candidate"], "q_learning")
+
 
 if __name__ == "__main__":
     unittest.main()
