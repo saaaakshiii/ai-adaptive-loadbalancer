@@ -47,7 +47,9 @@ services:
         condition: service_healthy
 
   dashboard:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
     command: streamlit run dashboard/app.py --server.address 0.0.0.0 --server.port 8501
     environment:
       LB_URL: http://load-balancer:8000
@@ -56,7 +58,9 @@ services:
       - load-balancer
 
   locust:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.locust
     command: locust -f experiments/locustfile.py --host http://load-balancer:8000 --web-host 0.0.0.0
     profiles: ["loadtest"]
     ports: ["8089:8089"]

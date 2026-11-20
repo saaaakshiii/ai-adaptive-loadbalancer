@@ -13,3 +13,22 @@ __pycache__/
 
 # Environment variables
 .env
+# Local backup files
+*.backup
+*.save
+*.pre_adaptive_backup
+*_backup.py
+
+# Numbered editor backup files
+*.save.*
+
+# Generated learning state (keep local; production uses persistent storage)
+data/q_table.json
+data/q_table.tmp
+
+# Dashboard local configuration
+.streamlit/secrets.toml
+
+# Coverage and generated reports
+.coverage
+htmlcov/

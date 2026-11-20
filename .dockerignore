@@ -1,10 +1,25 @@
+# Python virtual environments
 .venv/
 .venv312/
+.dashboard-venv/
 venv/
+
+# Python cache and test artifacts
 __pycache__/
 *.py[cod]
-.git/
-.gitignore
 .pytest_cache/
 .mypy_cache/
+.coverage
+htmlcov/
+
+# Git and editor files
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Streamlit local configuration
 .streamlit/
+
+# OS files
+.DS_Store
