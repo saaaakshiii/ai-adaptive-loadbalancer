@@ -89,7 +89,32 @@ class QLearningAgent:
             if self.updates % 10 == 0:
                 self.save()
 
+    def export_state(self):
+        with self.lock:
+            return {
+                "q_table": {
+                    state: list(values)
+                    for state, values in self.q.items()
+                },
+                "epsilon": self.epsilon,
+                "updates": self.updates,
+            }
 
+    def restore_state(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("Invalid Q-learning snapshot")
+
+        q_table = data.get("q_table", {})
+        if not isinstance(q_table, dict):
+            raise ValueError("Invalid Q-table")
+
+        with self.lock:
+            self.q = {
+                str(state): [float(value) for value in values]
+                for state, values in q_table.items()
+            }
+            self.epsilon = float(data.get("epsilon", self.epsilon))
+            self.updates = int(data.get("updates", 0))
 
     def save(self):
         with self.lock:
