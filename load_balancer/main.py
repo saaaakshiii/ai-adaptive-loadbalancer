@@ -22,10 +22,14 @@ logger = logging.getLogger(__name__)
 redis_client = None
 metrics_collector_task = None
 adaptive_controller_task = None
+q_learning_persistence_task = None
 
 METRICS_KEY = "metrics:snapshot"
 METRICS_INTERVAL = 1
 METRICS_TTL = 5
+
+QL_STATE_KEY = "q_learning:state"
+QL_SAVE_INTERVAL = 10
 
 active_requests = {
     backend["name"]: 0
@@ -63,7 +67,7 @@ client: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, redis_client, metrics_collector_task
-    global adaptive_controller_task
+    global adaptive_controller_task, q_learning_persistence_task
 
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(10.0, connect=2.0)
@@ -78,6 +82,9 @@ async def lifespan(app: FastAPI):
 
     await redis_client.ping()
 
+    # Restore Q-learning state before accepting requests.
+    await restore_q_learning_state()
+
     # Create the first snapshot before accepting requests.
     await refresh_metrics_snapshot()
 
@@ -87,24 +94,43 @@ async def lifespan(app: FastAPI):
         adaptive_controller_loop()
     )
 
+    q_learning_persistence_task = asyncio.create_task(
+       q_learning_persistence_loop()
+    )
+    
     try:
         yield
     finally:
-        # Stop both background tasks.
-        metrics_collector_task.cancel()
-        adaptive_controller_task.cancel()
+        # Stop all background tasks.
+        tasks = (
+            metrics_collector_task,
+            adaptive_controller_task,
+            q_learning_persistence_task,
+        )
 
-        for task in (metrics_collector_task, adaptive_controller_task):
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for task in tasks:
+            if task is not None:
+                task.cancel()
 
-        # Persist state and close shared connections.
+        for task in tasks:
+            if task is not None:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        # Persist final Q-learning state.
+        try:
+            await save_q_learning_state()
+        except Exception:
+            logger.exception("Final Redis persistence failed")
+
+        # Preserve local JSON persistence for Docker.
         agent.save()
+
+        # Close shared connections.
         await redis_client.aclose()
         await client.aclose()
-
 
 app = FastAPI(title="AI Adaptive Load Balancer", lifespan=lifespan)
 
@@ -148,6 +174,41 @@ async def metrics_collector():
             logger.exception("Metrics collection failed")
 
         await asyncio.sleep(METRICS_INTERVAL)
+
+async def save_q_learning_state():
+    snapshot = agent.export_state()
+
+    await redis_client.set(
+        QL_STATE_KEY,
+        json.dumps(snapshot)
+    )
+
+
+async def restore_q_learning_state():
+    snapshot = await redis_client.get(QL_STATE_KEY)
+
+    if snapshot is None:
+        logger.info("No saved Q-learning state found in Redis")
+        return
+
+    agent.restore_state(json.loads(snapshot))
+
+    logger.info(
+        "Restored Q-learning state from Redis: %s updates",
+        agent.updates
+    )
+
+
+async def q_learning_persistence_loop():
+    while True:
+        try:
+            await save_q_learning_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Q-learning persistence failed")
+
+        await asyncio.sleep(QL_SAVE_INTERVAL)
 
 async def adaptive_controller_loop():
     global algorithm, last_adaptive_decision

@@ -77,6 +77,38 @@ class TestQLearningAgent(unittest.TestCase):
         self.assertEqual(loaded_agent.updates, 1)
         self.assertEqual(loaded_agent.q, self.agent.q)
 
+    def test_export_state(self):
+        self.agent.update(
+            state="000",
+            action=1,
+            reward=3.0,
+            next_state="001",
+            next_healthy=[0, 1, 2],
+            n_actions=3,
+        )
+
+        snapshot = self.agent.export_state()
+
+        self.assertEqual(snapshot["updates"], 1)
+        self.assertEqual(snapshot["epsilon"], self.agent.epsilon)
+        self.assertEqual(snapshot["q_table"], self.agent.q)
+
+    def test_restore_state(self):
+        snapshot = {
+            "q_table": {
+                "000": [0.0, 2.5, 1.0],
+                "001": [1.5, 0.0, 0.5],
+            },
+            "epsilon": 0.12,
+            "updates": 42,
+        }
+
+        self.agent.restore_state(snapshot)
+
+        self.assertEqual(self.agent.q, snapshot["q_table"])
+        self.assertEqual(self.agent.epsilon, 0.12)
+        self.assertEqual(self.agent.updates, 42)
+
 
 if __name__ == "__main__":
     unittest.main()
